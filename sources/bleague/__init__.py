@@ -273,15 +273,16 @@ async def fetch_team_catalog() -> dict[str, dict]:
 # ---------------------------------------------------------------------------
 
 
-async def fetch_game_detail(game_id: str) -> dict | None:
+async def fetch_game_detail(game_id: str, use_cache: bool = True) -> dict | None:
     """Fetch /api/v9/game/{game_id} and return the parsed game dict.
 
-    Cached briefly: the stream URLs are plain CDN paths (no expiring tokens),
-    and listing endpoints would otherwise refetch every game on every request.
+    Cached briefly for listings: the stream URLs are plain CDN paths (no
+    expiring tokens), and listing endpoints would otherwise refetch every game
+    on every request. Pass use_cache=False for a fresh read.
     """
     url = f"{API_BASE}/v9/game/{game_id}"
     try:
-        data = await fetch_json(url, cache=detail_cache)
+        data = await fetch_json(url, cache=detail_cache if use_cache else None)
     except UpstreamError:
         log.debug("Game detail fetch failed for %s", game_id)
         return None
@@ -296,7 +297,7 @@ async def fetch_game_detail(game_id: str) -> dict | None:
 # ---------------------------------------------------------------------------
 
 
-def compute_phase(game_row: dict) -> str:
+def compute_phase(game_row: dict, now: datetime | None = None) -> str:
     """Compute game phase from game_end_f and timestamp fields.
     
     Returns one of: IN_FUTURE, IN_FUTURE_ONE_DAY, PLAYING,
@@ -341,7 +342,7 @@ def compute_phase(game_row: dict) -> str:
         except ValueError:
             return None
     
-    now_jst = datetime.now(JST)
+    now_jst = (now or datetime.now(timezone.utc)).astimezone(JST)
     start = parse_ts(live_start)
     end   = parse_ts(live_end)
     miss  = parse_ts(missed_end)
@@ -418,8 +419,13 @@ def pick_quality(urls: list | None) -> str | None:
     return urls[0].get("url") if urls else None
 
 
-async def resolve_stream_for_match(match_id: str) -> str | None:
-    """Resolve CDN playlist URL for a match on demand (never cached).
+async def resolve_stream_for_match(match_id: str, use_cache: bool = False) -> str | None:
+    """Resolve CDN playlist URL for a match on demand.
+
+    Status is evaluated from the game detail at call time, so an entry listed
+    as Upcoming in a stale playlist plays live once the live window opens,
+    and plays the catch-up once the game is over. Fresh by default (/stream
+    clicks); listings pass use_cache=True.
     
     Flow:
       1. Fetch game detail → get live_urls / missed_urls
@@ -427,7 +433,7 @@ async def resolve_stream_for_match(match_id: str) -> str | None:
       3. Pick the best available quality
       4. Return CDN URL string
     """
-    detail = await fetch_game_detail(match_id)
+    detail = await fetch_game_detail(match_id, use_cache=use_cache)
     if not detail:
         return None
     
@@ -582,7 +588,7 @@ async def process_live_games(all_games: list[dict], team_index: dict) -> list[di
         enriched.append(enrich_game(game_row, team_index, phase))
     
     playing = [g for g in enriched if g["computed_phase"] == "PLAYING"]
-    urls = await asyncio.gather(*(resolve_stream_for_match(g["match_id"]) for g in playing))
+    urls = await asyncio.gather(*(resolve_stream_for_match(g["match_id"], use_cache=True) for g in playing))
     for game, url in zip(playing, urls):
         game["stream_url"] = url
     
