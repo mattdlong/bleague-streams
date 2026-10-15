@@ -1,9 +1,11 @@
-# Bleague Streams — Progress Report
+# Bleague Streams - Progress Report
 
 **Date:** 2026-10-15  
-**Status:** ✅ Complete — 8/8 tests passing, all endpoints verified  
+**Status:** ✅ Complete — all endpoints verified, deployed and pushed  
 **Service URL:** `https://bleague-streams-191043172686.asia-northeast1.run.app`  
-**Project:** `virtual-machines-437208` / `asia-northeast1`
+**Repository:** `https://github.com/mattdlong/bleague-streams` (private)  
+**Commits:** `eb0a1ff` (initial) → `3d608a9` (routing fix)  
+**Project:** `virtual-machines-437208` / `asia-northeast1`  
 
 ---
 
@@ -27,6 +29,7 @@ Mirrors the architecture of [nbl1-streams](https://github.com/mattdlong/nbl1-str
 | `/games/live` | 248 B.LEAGUE men's games (119 with stream URLs) | ✅ |
 | `/games/completed` | 32 completed games (all with catch-up videos) | ✅ |
 | `/pl/` | 280 M3U entries grouped by league + phase | ✅ |
+| `/pl` | 280 M3U entries (no trailing slash — works after routing fix) | ✅ |
 | `/pl/epg.xml` | 280 channels, 531 programme slots | ✅ |
 | `/stream/{match_id}` | 302 redirect to Akamai HLS master playlist | ✅ |
 | `/playkey` | 16-byte AES-128 license key | ✅ |
@@ -37,14 +40,14 @@ Mirrors the architecture of [nbl1-streams](https://github.com/mattdlong/nbl1-str
 
 ### Source layers
 
-- **`main.py`** — FastAPI app with lifespan, 8 endpoints, playlist helpers, EPG builder
-- **`sources/bleague/__init__.py`** — Core business logic (~630 lines):
+- **`main.py`** - FastAPI app with lifespan, 8 endpoints, playlist helpers, EPG builder
+- **`sources/bleague/__init__.py`** - Core business logic (~630 lines):
   - Hardcoded auth headers & FREEKEY credential
-  - `fetch_day_schedule()` / `fetch_month_schedule()` — SoftBank API calls
-  - `fetch_team_catalog()` — Builds index of 55 B.LEAGUE teams (string-normalized IDs)
-  - `compute_phase()` — 7-case clock evaluation per SCHEDULE.md (JST-aware)
-  - `resolve_stream_for_match()` — Game detail → quality selection → CDN URL
-  - `enrich_game()` — Builds canonical game dict with team names, scores, venues
+  - `fetch_day_schedule()` / `fetch_month_schedule()` - SoftBank API calls
+  - `fetch_team_catalog()` - Builds index of 55 B.LEAGUE teams (string-normalized IDs)
+  - `compute_phase()` - 7-case clock evaluation per SCHEDULE.md (JST-aware)
+  - `resolve_stream_for_match()` - Game detail → quality selection → CDN URL
+  - `enrich_game()` - Builds canonical game dict with team names, scores, venues
 
 ### Data pipeline
 
@@ -76,6 +79,7 @@ B.LEAGUE uses HLS AES-128 segment encryption via SoftBank's `/api/v1/playkey` li
 | `LocalProtocolError: Illegal header value b'- '` | httpx rejects `- ` (dash + space) in `X-BASKETLIVE-ACCESSTOKEN` per RFC 7230 | Normalize to single `-` without trailing space |
 | Team catalog filter no-op | Condition used `pass` block with broken logic | Replaced with explicit `valid_league_substrings` matching |
 | Team enrichment returns `KEY NOT IN CATALOG` | Catalog returns `team_id` as **int**, games reference as **str** | Normalize to `str(tid)` when building index keys |
+| Catch-all route blocks `/pl`, `/stream/{id}`, `/pl/epg.xml` | Exact string match in blocklist failed on sub-paths (e.g. `stream/507231 ≠ "stream"`) | Blocklist now uses `startswith` prefix matching; added `/pl` alias route |
 
 ---
 
@@ -83,7 +87,7 @@ B.LEAGUE uses HLS AES-128 segment encryption via SoftBank's `/api/v1/playkey` li
 
 - **httpx over aiohttp**: Async-native, strict RFC compliance, matches NBL1 project pattern
 - **No env vars**: All credentials hardcoded (matches NBL1's `Authorization: Bearer xxx.app` compile-time constant pattern)
-- **Single source module**: Only `sources/bleague/__init__.py` and `proxy.py` — no multi-source aggregation needed
+- **Single source module**: Only `sources/bleague/__init__.py` and `proxy.py` - no multi-source aggregation needed
 - **Cloud Run `asia-northeast1`**: Required for SoftBank API access (geo-block returns 403 from outside Japan)
 - **No browser dependency**: Explicitly removed Playwright Chromium from Dockerfile (only needed for SBS source in upstream project)
 
@@ -112,7 +116,15 @@ B.LEAGUE uses HLS AES-128 segment encryption via SoftBank's `/api/v1/playkey` li
 ✓ TEST 8  /playkey          — returns 16-byte AES key
 ────────────────────────────────────────────────────────────
 RESULTS: 8/8 tests passed
-Service is production-ready
+```
+
+### Trailing-slash routing fix (commit `3d608a9`)
+
+After initial deployment, requests to `/pl` (no trailing slash) returned `{"error":"not_found"}`. The root cause: the catch-all `/{path:path}` route used exact string matching (`path in ("pl", ...)`) which incorrectly matched sub-paths like `stream/507231` and `pl/epg.xml`. Fixed by switching to `startswith` prefix checks and adding `/pl` as an alias for `/pl/`.
+
+```
+$ curl https://...run.app/pl
+#EXTM3U url-tvg="https://.../pl/epg.xml"
 ```
 
 All endpoints verified against live container in `asia-northeast1`.
