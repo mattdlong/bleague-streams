@@ -282,6 +282,7 @@ VIDEO_TYPE_LABELS = {"full_game": "Full Game"}
 
 
 @app.get("/pl/", response_class=PlainTextResponse)
+@app.get("/pl",  response_class=PlainTextResponse)
 async def playlist(request: Request):  # type: ignore[reportUnknownParameterType, reportUnknownMemberType]
     """IPTV-compatible M3U playlist with B.LEAGUE games."""
     live_games = await bleague.fetch_live_games()
@@ -475,7 +476,10 @@ async def playkey(request: Request):
 @app.api_route("/{path:path}")
 async def catch_all_cdn(path: str, request: Request) -> Response:
     """Forward all non-explicit routes to the Akamai CDN, rewriting #EXT-X-KEY URIs."""
-    if path in ("health", "games/live", "games/completed", "stream", "pl", "playkey", "epg.xml"):
+    # Don't intercept our own API endpoints — let FastAPI route them normally.
+    # Check path prefix to handle sub-paths like stream/507231, pl/epg.xml, etc.
+    blocked = ("health", "games/live", "games/completed", "stream/", "pl/", "playkey", "epg.xml")
+    if any(path == p or path.startswith(p) for p in blocked):
         return JSONResponse(status_code=404, content={"error": "not_found"})
     return await forward_to_cdn(path, request)
 
