@@ -18,6 +18,16 @@ from sources.bleague.proxy import (
 
 log = logging.getLogger("bleague")
 
+# Viewer's local time for playlist labels and EPG descriptions (as nbl1-streams).
+LOCAL_TZ = timezone(timedelta(hours=7))
+
+
+def _local_start(game: dict) -> datetime | None:
+    start_utc = game.get("start_time_utc", "")
+    if not start_utc:
+        return None
+    return datetime.strptime(start_utc, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc).astimezone(LOCAL_TZ)
+
 
 # ---------------------------------------------------------------------------
 # App lifespan
@@ -269,13 +279,16 @@ def _game_label(game: dict, include_score: bool = True, show_local_time: bool = 
         if parts:
             label += f" ({'-'.join(parts)})"
     if show_local_time:
-        local = game.get("start_time_local", "")
-        if local:
-            label += f" - {local}"
+        local_dt = _local_start(game)
+        if local_dt:
+            label += f" - {local_dt.strftime('%d/%m %H:%M')}"
     else:
+        season = game.get("season_name", "")
+        if season:
+            label += f" - {season}"
         rnd = game.get("round")
         if rnd:
-            label += f" - R{rnd}"
+            label += f" R{rnd}"
     return label
 
 
@@ -399,11 +412,13 @@ def _game_desc(game: dict, phase: str = "upcoming") -> str:
 
     if phase == "upcoming":
         line = f"{home} take on {away}{venue_info}."
-        time_str = game.get("start_time_local", "")
-        if time_str:
-            line += f" Tune in at {time_str}."
+        local_dt = _local_start(game)
+        if local_dt:
+            line += f" Tune in at {local_dt.strftime('%H:%M')} on {local_dt.strftime('%A %d/%m')} to catch all the action"
         if match_info:
-            line += match_info + season_info + "."
+            line += f" from this{match_info}{season_info}."
+        else:
+            line += "."
     elif phase == "live":
         line = f"{home} are taking on {away}{venue_info}"
         if match_info:

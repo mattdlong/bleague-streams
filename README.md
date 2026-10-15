@@ -76,8 +76,8 @@ Calls from outside Japan to `api.basketball.mb.softbank.jp` receive a `403` acco
 | Path | Method | Response Type | Description |
 |------|--------|---------------|-------------|
 | `/health` | GET | `{"status": "ok"}` | Health check (response <500ms) |
-| `/games/live` | GET | JSON | Upcoming and in-progress games for today and tomorrow (JST); stream URL set while playing |
-| `/games/completed` | GET | JSON | Games finished in the last 7 days (JST) with catch-up URLs |
+| `/games/live` | GET | JSON | Upcoming and in-progress games starting today 00:00 UTC through tomorrow 23:59 UTC (as nbl1-streams); stream URL set while playing |
+| `/games/completed` | GET | JSON | Finished games that started in the last 10 days (from 00:00 UTC, as nbl1-streams) with catch-up URLs |
 | `/stream/{match_id}` | GET | 302 redirect or 404 | Resolves the CDN master URL and redirects to the same path on this service's CDN proxy; 404 if no stream available |
 | `/pl/` | GET | M3U text | IPTV-compatible playlist with grouped channels |
 | `/pl/epg.xml` | GET | XMLTV XML | Electronic program guide with channel programmes |

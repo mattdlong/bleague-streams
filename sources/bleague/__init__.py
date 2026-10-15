@@ -38,9 +38,9 @@ B_LEAGUE_NAMES = {"B.LEAGUE ONE", "B.LEAGUE PREMIER"}
 
 GAME_END_FLAGS = {"9": "before", "0": "during", "1": "over", "99": "cancel"}
 
-# Live listing covers today and tomorrow (JST); completed looks back this many days.
-LIVE_DAYS_AHEAD         = 1
-COMPLETED_LOOKBACK_DAYS = 7
+# Windows mirror nbl1-streams: live = games starting today 00:00 UTC through
+# tomorrow 23:59:59 UTC; completed = games started since 00:00 UTC 10 days ago.
+COMPLETED_LOOKBACK_DAYS = 10
 
 # Overseas opponents (pre-season / invitational) aren't in /api/v3/teams,
 # so there is no upstream English name for them.
@@ -501,7 +501,7 @@ def enrich_game(game_row: dict, team_index: dict, phase: str) -> dict:
             "name_en":   home_en,
             "name_es":   home_idx.get("name_es"),
             "score":     None,                       # no score on schedule rows
-            "logo_url":  None,
+            "logo_url":  game_row.get("home_team_logo"),
         },
         "away_team": {
             "id":        away_id,
@@ -509,7 +509,7 @@ def enrich_game(game_row: dict, team_index: dict, phase: str) -> dict:
             "name_en":   away_en,
             "name_es":   away_idx.get("name_es"),
             "score":     None,
-            "logo_url":  None,
+            "logo_url":  game_row.get("away_team_logo"),
         },
         "live_urls":       [],
         "missed_urls":     [],
@@ -534,16 +534,21 @@ LIVE_LIST_PHASES = {"PLAYING", "IN_FUTURE_ONE_DAY", "IN_FUTURE"}
 COMPLETED_LIST_PHASES = {"FINISHED_MISSED_MATCH", "FINISHED"}
 
 
-def _jst_today():
-    return datetime.now(timezone(timedelta(hours=9))).date()
-
-
-def _in_date_range(game_row: dict, first, last) -> bool:
+def _row_start_utc(game_row: dict) -> str:
+    """Tip-off as an ISO UTC string ('' if unparseable), for window comparisons."""
     try:
-        d = datetime.strptime(game_row.get("game_date") or "", "%Y-%m-%d").date()
+        return _jst_to_utc_iso(f"{game_row.get('game_date', '')} {game_row.get('game_time', '')}")
     except ValueError:
-        return False
-    return first <= d <= last
+        return ""
+
+
+async def _fetch_window(from_utc: str, to_utc: str) -> list[dict]:
+    """Schedule rows whose tip-off (UTC) falls in [from_utc, to_utc]."""
+    jst = timezone(timedelta(hours=9))
+    first = datetime.fromisoformat(from_utc).replace(tzinfo=timezone.utc).astimezone(jst).date()
+    last  = datetime.fromisoformat(to_utc).replace(tzinfo=timezone.utc).astimezone(jst).date()
+    games = await _fetch_months(first, last)
+    return [g for g in games if from_utc <= _row_start_utc(g) <= to_utc]
 
 
 async def _fetch_months(first, last) -> list[dict]:
@@ -628,18 +633,18 @@ async def process_completed_games(all_games: list[dict], team_index: dict) -> li
 
 
 async def fetch_live_games() -> list[dict]:
-    """Upcoming and in-progress B.LEAGUE games for today and tomorrow (JST)."""
-    today = _jst_today()
-    last = today + timedelta(days=LIVE_DAYS_AHEAD)
-    games, team_index = await asyncio.gather(_fetch_months(today, last), fetch_team_catalog())
-    games = [g for g in games if _in_date_range(g, today, last)]
+    """Upcoming and in-progress games starting today or tomorrow (UTC), as nbl1-streams."""
+    now = datetime.now(timezone.utc)
+    today_start = now.strftime("%Y-%m-%dT00:00:00")
+    today_end = (now + timedelta(days=1)).strftime("%Y-%m-%dT23:59:59")
+    games, team_index = await asyncio.gather(_fetch_window(today_start, today_end), fetch_team_catalog())
     return await process_live_games(games, team_index)
 
 
 async def fetch_completed_games() -> list[dict]:
-    """B.LEAGUE games finished in the last COMPLETED_LOOKBACK_DAYS days (JST)."""
-    today = _jst_today()
-    first = today - timedelta(days=COMPLETED_LOOKBACK_DAYS)
-    games, team_index = await asyncio.gather(_fetch_months(first, today), fetch_team_catalog())
-    games = [g for g in games if _in_date_range(g, first, today)]
+    """Finished games started in the last COMPLETED_LOOKBACK_DAYS days (UTC), as nbl1-streams."""
+    now = datetime.now(timezone.utc)
+    from_start = (now - timedelta(days=COMPLETED_LOOKBACK_DAYS)).strftime("%Y-%m-%dT00:00:00")
+    now_str = now.strftime("%Y-%m-%dT%H:%M:%S")
+    games, team_index = await asyncio.gather(_fetch_window(from_start, now_str), fetch_team_catalog())
     return await process_completed_games(games, team_index)
