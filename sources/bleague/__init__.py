@@ -507,7 +507,7 @@ def enrich_game(game_row: dict, team_index: dict, phase: str) -> dict:
             "name_en":   home_en,
             "name_es":   home_idx.get("name_es"),
             "score":     None,                       # no score on schedule rows
-            "logo_url":  game_row.get("home_team_logo"),
+            "logo_url":  _clean_logo(game_row.get("home_team_logo")),
         },
         "away_team": {
             "id":        away_id,
@@ -515,12 +515,18 @@ def enrich_game(game_row: dict, team_index: dict, phase: str) -> dict:
             "name_en":   away_en,
             "name_es":   away_idx.get("name_es"),
             "score":     None,
-            "logo_url":  game_row.get("away_team_logo"),
+            "logo_url":  _clean_logo(game_row.get("away_team_logo")),
         },
         "live_urls":       [],
         "missed_urls":     [],
         "stream_url":      None,
     }
+
+
+def _clean_logo(url: str | None) -> str | None:
+    """Drop the cache-buster query (…/727_ball.png?1788454969) so playlist
+    attributes are plain URLs; the image is served the same without it."""
+    return url.split("?", 1)[0] if url else None
 
 
 def _jst_to_utc_iso(jst_str: str) -> str:

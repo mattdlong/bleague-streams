@@ -43,6 +43,15 @@ async def lifespan(app: FastAPI):  # type: ignore[reportUnknownMemberType]
 
 app = FastAPI(lifespan=lifespan)  # type: ignore[reportUnknownMemberType]
 
+
+@app.middleware("http")
+async def strip_shortlink_prefix(request: Request, call_next):
+    """The m11.li/bl shortlink redirects /bl/<x> to /pl//<x>; route it to /<x>."""
+    path = request.scope["path"]
+    if path.startswith("/pl//"):
+        request.scope["path"] = path[len("/pl/"):]
+    return await call_next(request)
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -293,7 +302,8 @@ def _game_label(game: dict, include_score: bool = True, show_local_time: bool = 
 
 
 def _channel_id(game: dict, vtype: str | None = None) -> str:
-    gid = game.get("match_id", "")
+    # Source-prefixed like the au-streams channel ids (never a bare number).
+    gid = f"bleague.{game.get('match_id', '')}"
     if vtype:
         return f"{gid}.{vtype}"
     return gid
