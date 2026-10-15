@@ -49,8 +49,9 @@ EXTRA_TEAM_NAMES_EN = {
     "10576": "TELEKOM BASKETS BONN",
 }
 
-QUALITY_DEFAULT = "Middle"
 QUANTITY_MAP    = {"8M": "Full HD", "4M": "High", "1.5M": "Middle", "500K": "Low"}
+# Best first: Full HD 1920x1080 (~6.1 Mbps), High 1280x720, Middle 854x480, Low 320x180.
+QUALITY_PREFERENCE = ("Full HD", "High", "Middle", "Low")
 
 # ---------------------------------------------------------------------------
 # Caches & semaphore
@@ -403,17 +404,17 @@ def select_stream_list(phase: str, game_end_f: str,
     return None
 
 
-def pick_quality(urls: list | None, preset: str = QUALITY_DEFAULT) -> str | None:
-    """From a list of quality objects, pick the one matching the default preset label."""
+def pick_quality(urls: list | None) -> str | None:
+    """From a list of quality objects, pick the highest quality available."""
     if not urls:
         return None
     
-    target = QUANTITY_MAP.get(preset, preset)
-    for entry in urls:
-        if entry.get("quality") == target:
-            return entry.get("url")
+    by_label = {entry.get("quality"): entry.get("url") for entry in urls}
+    for label in QUALITY_PREFERENCE:
+        if by_label.get(label):
+            return by_label[label]
     
-    # Fallback: use first available
+    # Fallback: unknown labels, use first available
     return urls[0].get("url") if urls else None
 
 
@@ -423,7 +424,7 @@ async def resolve_stream_for_match(match_id: str) -> str | None:
     Flow:
       1. Fetch game detail → get live_urls / missed_urls
       2. Select appropriate list
-      3. Pick quality preset
+      3. Pick the best available quality
       4. Return CDN URL string
     """
     detail = await fetch_game_detail(match_id)
@@ -442,7 +443,7 @@ async def resolve_stream_for_match(match_id: str) -> str | None:
         return None
     
     urls_list = live_urls if list_choice == "live_urls" else missed_urls
-    return pick_quality(urls_list, preset="Middle")
+    return pick_quality(urls_list)
 
 
 # ---------------------------------------------------------------------------
@@ -592,7 +593,7 @@ async def _attach_catchup(game: dict) -> None:
     live   = detail.get("live_urls") or []
     # Legacy fallback: no catch-up list, but live URL still exists
     urls, title = (missed, "Catch-Up") if missed else (live, "Replay")
-    url = pick_quality(urls, preset="Middle")
+    url = pick_quality(urls)
     if url:
         game["stream_url"] = url
         game["videos"] = {

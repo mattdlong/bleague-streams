@@ -151,7 +151,7 @@ Games resolve streams through the game-detail endpoint:
 
 1. Call `/api/v9/game/{game_id}` → returns `live_urls[]` and `missed_urls[]`
 2. Select appropriate list based on computed phase (per SCHEDULE.md Section 5.2)
-3. Pick "Middle" quality (default preset)
+3. Pick the best available quality (Full HD → High → Middle → Low)
 4. Redirect (302) to the same CDN path on this service, e.g. `/ch914/ndvr_MAN02.m3u8`. The playlists use relative URIs, so variant playlists and segments then also come through the proxy
 
 Game detail is cached for 60s (the CDN URLs carry no expiring tokens), and listing endpoints fetch details concurrently.
@@ -176,7 +176,7 @@ The proxy bridges this gap:
 | `1.5M` | Middle | 854×480 | ~1.1 Mbps |
 | `500K` | Low | 320×180 | ~628 Kbps |
 
-Default preset: Middle (854×480, ~1 Mbps). Configurable via env var `BLEAGUE_QUALITY`.
+The service picks the best quality the game offers: Full HD (1920×1080) where available, falling back to High, Middle, then Low.
 
 ## File Structure
 
