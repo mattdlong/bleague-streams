@@ -13,7 +13,7 @@ from sources import bleague
 from sources.bleague.proxy import (
     forward_to_cdn,
     handle_playkey,
-    handle_stream_proxy,
+    proxied_stream_url,
 )
 
 log = logging.getLogger("bleague")
@@ -102,8 +102,8 @@ async def health_diagnostic():
             phase_dist[p["phase"]] = phase_dist.get(p["phase"], 0) + 1
         results["phase_distribution"] = phase_dist
         
-        # Step 5: Filter by LIVE_PHASES
-        live_only = [p for p in with_phases if p["phase"] in bleague.LIVE_PHASES]
+        # Step 5: Filter by LIVE_LIST_PHASES
+        live_only = [p for p in with_phases if p["phase"] in bleague.LIVE_LIST_PHASES]
         results["live_filter"] = len(live_only)
         
         # Step 6: Get team catalog
@@ -223,15 +223,23 @@ async def games_completed() -> dict[str, Any]:  # type: ignore[reportUnknownVari
 
 
 @app.get("/stream/{match_id}")
-async def stream_proxy(match_id: str) -> Any:  # type: ignore[reportUnknownVariableType]
-    """Resolve and redirect to the HLS stream URL for a match."""
+async def stream_proxy(match_id: str, request: Request) -> Any:  # type: ignore[reportUnknownVariableType]
+    """Resolve the HLS stream for a match and redirect to it via our CDN proxy.
+
+    Redirecting through the proxy (not straight to Akamai) is what lets the
+    #EXT-X-KEY URI be rewritten to /playkey, so the player can decrypt.
+    """
     url = await bleague.resolve_stream_for_match(match_id)
     if url is None:
         return JSONResponse(
             status_code=404,
             content={"error": "no_stream", "match_id": match_id},
         )
-    return RedirectResponse(url=url, status_code=302)
+    proxied = proxied_stream_url(url, str(request.base_url))
+    if proxied is None:
+        log.warning("Stream URL for %s is outside the CDN base; redirecting directly", match_id)
+        proxied = url
+    return RedirectResponse(url=proxied, status_code=302)
 
 
 # ---------------------------------------------------------------------------
@@ -239,10 +247,19 @@ async def stream_proxy(match_id: str) -> Any:  # type: ignore[reportUnknownVaria
 # ---------------------------------------------------------------------------
 
 
+def _team_name(team: dict) -> str:
+    """English club name from the team catalog, falling back to Japanese if absent."""
+    return team.get("name_en") or team.get("name_es") or team.get("name_jp") or "?"
+
+
 def _game_label(game: dict, include_score: bool = True, show_local_time: bool = False) -> str:
     home = game.get("home_team") or {}
     away = game.get("away_team") or {}
-    label = f"{home.get('name_jp', '?')} vs {away.get('name_jp', '?')}"
+    if not home.get("id") and not away.get("id") and game.get("title"):
+        # Rows with no teams (TV shows, overseas tour games) only carry a title.
+        label = game["title"]
+    else:
+        label = f"{_team_name(home)} vs {_team_name(away)}"
     if include_score:
         parts = []
         if home.get("score"):
@@ -291,7 +308,7 @@ async def playlist(request: Request):  # type: ignore[reportUnknownParameterType
     base_url = str(request.base_url).rstrip("/")
     lines = [f"#EXTM3U url-tvg=\"{base_url}/pl/epg.xml\""]
 
-    # Live / In-Progress games (PLAYING + FINISHED_MISSED_MATCH)
+    # Live / upcoming games
     for game in sorted(live_games, key=lambda g: g.get("start_time_utc", "")):
         mid = game.get("match_id")
         if not mid:
@@ -303,8 +320,6 @@ async def playlist(request: Request):  # type: ignore[reportUnknownParameterType
         group_name = game.get("conference", "B.LEAGUE")
         if phase == "PLAYING":
             group = f"{group_name} Live"
-        elif phase == "FINISHED_MISSED_MATCH":
-            group = f"{group_name} Catch-Up"
         else:
             group = f"{group_name} Upcoming"
 
@@ -312,9 +327,12 @@ async def playlist(request: Request):  # type: ignore[reportUnknownParameterType
         lines.append(_m3u_entry(group, _game_label(game, show_local_time=True), url, logo, tvg_id=cid))
 
     # Completed games with videos
+    # Completed games also go via /stream/{id} so playback runs through the
+    # key-rewriting CDN proxy (a raw Akamai URL can't be decrypted by the player).
     for game in sorted(completed_games, key=lambda g: g.get("start_time_utc", ""), reverse=True):
         videos = game.get("videos")
-        if not videos:
+        mid = game.get("match_id")
+        if not videos or not mid:
             continue
         logo = (game.get("home_team") or {}).get("logo_url")
         label = _game_label(game, include_score=False)
@@ -323,7 +341,7 @@ async def playlist(request: Request):  # type: ignore[reportUnknownParameterType
             if vid and vid.get("stream_url"):
                 cid = _channel_id(game, vtype)
                 group = f"{game.get('conference', 'B.LEAGUE')} Completed"
-                lines.append(_m3u_entry(group, f"{label} [{VIDEO_TYPE_LABELS[vtype]}]", vid["stream_url"], logo, tvg_id=cid))
+                lines.append(_m3u_entry(group, f"{label} [{VIDEO_TYPE_LABELS[vtype]}]", f"{base_url}/stream/{mid}", logo, tvg_id=cid))
 
     return PlainTextResponse("\n".join(lines) + "\n", media_type="audio/x-mpegurl")
 
@@ -340,6 +358,14 @@ def _dt_to_xmltv(dt: datetime) -> str:
     return dt.strftime("%Y%m%d%H%M%S") + " +0000"
 
 
+def _add_clipped(tv: Element, cid: str, title: str, desc: str, start: datetime, stop: datetime,
+                 window_start: datetime, window_end: datetime, logo: str | None = None) -> None:
+    """Add a programme clipped to the EPG window; skip it if nothing is left."""
+    start, stop = max(start, window_start), min(stop, window_end)
+    if start < stop:
+        _add_programme(tv, cid, title, desc, start, stop, logo)
+
+
 def _add_programme(tv: Element, cid: str, title: str, desc: str, start: datetime, stop: datetime, logo: str | None = None):  # type: ignore[reportUnknownMemberType, reportUnknownArgumentType]
     prog = SubElement(tv, "programme", start=_dt_to_xmltv(start), stop=_dt_to_xmltv(stop), channel=cid)
     t = SubElement(prog, "title", lang="en")
@@ -353,8 +379,8 @@ def _add_programme(tv: Element, cid: str, title: str, desc: str, start: datetime
 
 
 def _game_desc(game: dict, phase: str = "upcoming") -> str:
-    home = (game.get("home_team") or {}).get("name_jp", "?")
-    away = (game.get("away_team") or {}).get("name_jp", "?")
+    home = _team_name(game.get("home_team") or {})
+    away = _team_name(game.get("away_team") or {})
     venue = game.get("venue")
 
     venue_info = f" at {venue}" if venue else ""
@@ -362,8 +388,10 @@ def _game_desc(game: dict, phase: str = "upcoming") -> str:
     rnd = game.get("round")
     match_info = ""
     if rnd:
-        ftype = game.get("fixture_type", "").lower()
-        if ftype and ftype != "regular":
+        # fixture_type is the competition (e.g. "B.LEAGUE PRE-SEASON GAME");
+        # only mention it when it differs from the league itself.
+        ftype = game.get("fixture_type") or ""
+        if ftype and ftype != season:
             match_info = f" {ftype} round {rnd} match"
         else:
             match_info = f" round {rnd} match"
@@ -412,13 +440,9 @@ def _build_epg(live_games: list[dict], completed_games: list[dict], window_start
         game_start = datetime.strptime(start_str, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
         game_end = game_start + PROGRAMME_DURATION
 
-        if game_start > window_start:
-            _add_programme(tv, cid, f"Upcoming: {base_title}", _game_desc(game, "upcoming"), window_start, game_start, logo)
-
-        _add_programme(tv, cid, base_title, _game_desc(game, "live"), game_start, game_end, logo)
-
-        if game_end < window_end:
-            _add_programme(tv, cid, f"Completed: {base_title}", _game_desc(game, "completed"), game_end, window_end, logo)
+        _add_clipped(tv, cid, f"Upcoming: {base_title}", _game_desc(game, "upcoming"), window_start, game_start, window_start, window_end, logo)
+        _add_clipped(tv, cid, base_title, _game_desc(game, "live"), game_start, game_end, window_start, window_end, logo)
+        _add_clipped(tv, cid, f"Completed: {base_title}", _game_desc(game, "completed"), game_end, window_end, window_start, window_end, logo)
 
     for game in completed_games:
         videos = game.get("videos")
@@ -426,11 +450,6 @@ def _build_epg(live_games: list[dict], completed_games: list[dict], window_start
             continue
         base_title = _game_label(game, include_score=False)
         desc = _game_desc(game, "completed")
-        start_str = game.get("start_time_utc", "")
-        if not start_str:
-            continue
-        start_dt = datetime.strptime(start_str, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
-        stop_dt = start_dt + PROGRAMME_DURATION
 
         for vtype, vtype_label in VIDEO_TYPE_LABELS.items():
             vid = videos.get(vtype)
@@ -446,7 +465,9 @@ def _build_epg(live_games: list[dict], completed_games: list[dict], window_start
                 if logo:
                     SubElement(ch, "icon", src=logo)
 
-                _add_programme(tv, cid, title, desc, start_dt, stop_dt, logo)
+                # Catch-up is on demand, so it fills the whole guide window
+                # (the original tip-off is usually before the window starts).
+                _add_programme(tv, cid, title, desc, window_start, window_end, logo)
 
     return b'<?xml version="1.0" encoding="UTF-8"?>\n' + tostring(tv, encoding="unicode").encode("utf-8")
 
@@ -475,12 +496,11 @@ async def playkey(request: Request):
 
 @app.api_route("/{path:path}")
 async def catch_all_cdn(path: str, request: Request) -> Response:
-    """Forward all non-explicit routes to the Akamai CDN, rewriting #EXT-X-KEY URIs."""
-    # Don't intercept our own API endpoints — let FastAPI route them normally.
-    # Check path prefix to handle sub-paths like stream/507231, pl/epg.xml, etc.
-    blocked = ("health", "games/live", "games/completed", "stream/", "pl/", "playkey", "epg.xml")
-    if any(path == p or path.startswith(p) for p in blocked):
-        return JSONResponse(status_code=404, content={"error": "not_found"})
+    """Forward /ch{NNN}/... to the Akamai CDN, rewriting #EXT-X-KEY URIs.
+
+    Explicit routes are registered first and win; forward_to_cdn 404s any
+    path that isn't a CDN channel path.
+    """
     return await forward_to_cdn(path, request)
 
 

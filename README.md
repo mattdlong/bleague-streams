@@ -76,13 +76,13 @@ Calls from outside Japan to `api.basketball.mb.softbank.jp` receive a `403` acco
 | Path | Method | Response Type | Description |
 |------|--------|---------------|-------------|
 | `/health` | GET | `{"status": "ok"}` | Health check (response <500ms) |
-| `/games/live` | GET | JSON | Today's live and upcoming games with phases and stream URLs |
-| `/games/completed` | GET | JSON | Recently completed games with catch-up URLs |
-| `/stream/{match_id}` | GET | 302 redirect or 404 | Resolves and redirects to CDN master URL; 404 if no stream available |
+| `/games/live` | GET | JSON | Upcoming and in-progress games for today and tomorrow (JST); stream URL set while playing |
+| `/games/completed` | GET | JSON | Games finished in the last 7 days (JST) with catch-up URLs |
+| `/stream/{match_id}` | GET | 302 redirect or 404 | Resolves the CDN master URL and redirects to the same path on this service's CDN proxy; 404 if no stream available |
 | `/pl/` | GET | M3U text | IPTV-compatible playlist with grouped channels |
 | `/pl/epg.xml` | GET | XMLTV XML | Electronic program guide with channel programmes |
 | `/playkey` | GET | 16 bytes binary | AES-128 decryption key (injects FREEKEY on upstream call) |
-| `/{any_other_path}` | GET | CDN forwarded | Forwards to Akamai CDN; rewrites `#EXT-X-KEY` URIs to `/playkey` |
+| `/ch{NNN}/...` | GET | CDN forwarded | Forwards to Akamai CDN; rewrites `#EXT-X-KEY` URIs to `/playkey`. Any other path is 404 |
 
 ### Output Formats
 
@@ -122,11 +122,11 @@ Calls from outside Japan to `api.basketball.mb.softbank.jp` receive a `403` acco
 
 **M3U Playlist (`/pl/`):**
 
-Games are grouped into `{League} Live`, `{League} Catch-Up`, `{League} Upcoming`, and `{League} Completed`. Live games use proxy redirect (`/stream/{id}`), completed games embed the actual CDN URL directly.
+Games are grouped into `{League} Live`, `{League} Upcoming`, and `{League} Completed`. Every entry points at `/stream/{id}`, so playback always runs through the key-rewriting CDN proxy. Labels use English club names from the team catalog (plus a small built-in table for overseas opponents not in the catalog); rows with no teams (TV shows, tour games) use the row's `title`.
 
 **XMLTV EPG (`/pl/epg.xml`):**
 
-Each game gets its own `<channel>` element with up to three programme slots per game (Upcoming → Live window → Completed window). Programme duration is fixed at 2 hours regardless of actual game length. Times are converted from JST to UTC for XMLTV compliance.
+Each upcoming/live game gets its own `<channel>` element with up to three programme slots (Upcoming → Live window → Completed window), clipped to the two-day guide window. Completed games are on demand, so each gets one programme spanning the whole window. Programme duration is fixed at 2 hours regardless of actual game length. Times are converted from JST to UTC for XMLTV compliance.
 
 ## How It Works
 
@@ -137,7 +137,7 @@ Game status is computed from `game_end_f` (server flag) combined with three time
 | Condition | Phase | Category |
 |-----------|-------|----------|
 | `flag == "99"` | `CANCELLED` | Excluded from output |
-| `end < now < missedEnd` | `FINISHED_MISSED_MATCH` | Catch-Up group |
+| `end < now < missedEnd` | `FINISHED_MISSED_MATCH` | Completed group (catch-up available) |
 | `now < day_midnight` | `IN_FUTURE` | Upcoming group |
 | `day < now < start` | `IN_FUTURE_ONE_DAY` | Upcoming group |
 | `start < now < end` | `PLAYING` | Live group |
@@ -152,9 +152,9 @@ Games resolve streams through the game-detail endpoint:
 1. Call `/api/v9/game/{game_id}` → returns `live_urls[]` and `missed_urls[]`
 2. Select appropriate list based on computed phase (per SCHEDULE.md Section 5.2)
 3. Pick "Middle" quality (default preset)
-4. Return CDN URL as 302 redirect target
+4. Redirect (302) to the same CDN path on this service, e.g. `/ch914/ndvr_MAN02.m3u8`. The playlists use relative URIs, so variant playlists and segments then also come through the proxy
 
-Stream resolution happens on-demand for each request — never cached.
+Game detail is cached for 60s (the CDN URLs carry no expiring tokens), and listing endpoints fetch details concurrently.
 
 ### AES-128 Decryption Proxy
 
@@ -203,7 +203,8 @@ bleague-streams/
 - Cancelled/abandoned games are silently excluded from both live and completed endpoints (same pattern as nbl1-streams). The filtering set does not explicitly include these statuses.
 - English name availability varies by league type — W-League teams are not in the `/api/v3/teams` catalog. B.LEEGUE men-only is enforced during catalog parsing.
 - Fixed 2-hour programme duration in EPG regardless of actual game length.
-- Single-request stream resolution (no caching) adds latency per viewer per game but ensures fresh tokens.
+- Venue names are Japanese only; the API has no English venue field for these rows.
+- Some players (e.g. ffmpeg) reject the extensionless segment names by default; ffmpeg needs `-extension_picky 0`.
 - Licence key is hardcoded in source. Rotation requires source change + redeploy.
 
 ## Dependencies

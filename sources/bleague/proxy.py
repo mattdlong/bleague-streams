@@ -12,11 +12,12 @@ This mirrors the pattern used by https://github.com/mattdlong/nbl1-streams
 for its streaming endpoints, adapted for B.LEEGUE's different architecture.
 """
 import logging
+import re
 
 import httpx
-from cachetools import TTLCache
-from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse, Response
+from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 from fastapi import Request
+from starlette.background import BackgroundTask
 
 import sources.bleague as _bleague
 
@@ -65,40 +66,66 @@ async def get_playkey() -> bytes:
     return key
 
 
-def rewrite_key_uris(m3u8_text: str, service_host: str) -> str:
+PLAYKEY_URI = 'URI="https://basketball.mb.softbank.jp/api/v1/playkey"'
+
+# CDN paths we forward: /ch{NNN}/... under CDN_BASE. Anything else is a 404.
+_CDN_PATH_RE = re.compile(r"^ch\d+/")
+
+# Upstream headers safe to pass through unchanged on a raw (unmodified) body.
+_PASSTHROUGH_HEADERS = ("content-type", "content-length", "content-encoding",
+                        "cache-control", "last-modified", "etag")
+
+
+def proxied_stream_url(cdn_url: str, base_url: str) -> str | None:
+    """Map a CDN playlist URL onto this service, e.g.
+    https://...akamaized.net/live/ch914/ndvr_MAN02.m3u8 -> {base_url}/ch914/ndvr_MAN02.m3u8
+
+    The playlists use relative URIs, so once the player loads the master
+    playlist from our host, every variant playlist and segment comes back
+    through forward_to_cdn() too. Returns None for URLs outside CDN_BASE.
+    """
+    if not cdn_url.startswith(_bleague.CDN_BASE):
+        return None
+    return f"{base_url.rstrip('/')}/{cdn_url[len(_bleague.CDN_BASE):]}"
+
+
+def rewrite_key_uris(m3u8_text: str, base_url: str) -> str:
     """Rewrite #EXT-X-KEY URI inside a media playlist text.
     
-    Replaces the softbank license server URI with our local /playkey endpoint.
+    Replaces the softbank license server URI with our /playkey endpoint.
     Only the URI attribute changes; IV and all other directives are preserved.
     """
-    old_uri = 'URI="https://basketball.mb.softbank.jp/api/v1/playkey"'
-    new_uri = f'URI="http://{service_host}/playkey"'
-    patched = m3u8_text.replace(old_uri, new_uri)
+    new_uri = f'URI="{base_url.rstrip("/")}/playkey"'
+    patched = m3u8_text.replace(PLAYKEY_URI, new_uri)
     if patched != m3u8_text:
         log.info("Rewrote KEY URI in playlist")
     return patched
 
 
 async def forward_to_cdn(request_path: str, request: Request) -> Response:
-    """Forward an incoming path to Akamai CDN, patching playlists if needed."""
+    """Forward /ch{NNN}/... to the Akamai CDN, patching playlists if needed.
+
+    Playlists are buffered so the KEY URI can be rewritten; segments are
+    streamed through with their upstream body and headers untouched.
+    """
     c = _bleague.client
     if c is None:
         return JSONResponse(status_code=502, content={"error": "not_initialized"})
     
-    # Path handling: distinguish absolute vs relative URIs
-    if request_path.startswith("/ch"):
-        cdn_path = request_path[1:]  # strip leading '/'
-    else:
-        cdn_path = f"ch/{request_path.lstrip('/')}"
+    cdn_path = request_path.lstrip("/")
+    if not _CDN_PATH_RE.match(cdn_path):
+        return JSONResponse(status_code=404, content={"error": "not_found"})
     
     url = _bleague.CDN_BASE + cdn_path
+    if request.url.query:
+        url += "?" + request.url.query
     
     # Use clean headers for CDN (no auth headers)
     fwd_headers = {"User-Agent": "python-urllib/3"}
-
     
     try:
-        resp = await c.get(url, follow_redirects=True, timeout=15.0, headers=fwd_headers)
+        req = c.build_request("GET", url, headers=fwd_headers, timeout=15.0)
+        resp = await c.send(req, stream=True, follow_redirects=True)
     except httpx.HTTPError as e:
         log.error("CDN forward failed for %s: %s", request_path, e)
         return JSONResponse(
@@ -107,30 +134,33 @@ async def forward_to_cdn(request_path: str, request: Request) -> Response:
         )
     
     ct = resp.headers.get("Content-Type", "")
-    body = resp.content
+    is_m3u8 = cdn_path.split("?")[0].endswith(".m3u8") or "mpegurl" in ct.lower()
     
-    # Check if this is an M3U8 playlist that needs rewriting
-    is_m3u8 = ".m3u8" in request_path or ("mpegURL" in ct.lower())
     if is_m3u8:
         try:
-            text = body.decode("utf-8", errors="replace")
-        except Exception:
-            pass  # not text, skip rewrite
-        else:
-            # Use host from request for accurate redirect target
-            service_host = request.url.hostname or "127.0.0.1"
-            port = request.url.port or ""
-            full_host = f"{service_host}:{port}" if port else service_host
-            
-            rewritten = rewrite_key_uris(text, full_host)
-            if rewritten != text:
-                body = rewritten.encode("utf-8")
+            await resp.aread()
+        finally:
+            await resp.aclose()
+        # resp.text is already decompressed, so upstream Content-Length /
+        # Content-Encoding no longer apply; Response sets its own length.
+        body = rewrite_key_uris(resp.text, str(request.base_url))
+        headers = {}
+        if "cache-control" in resp.headers:
+            headers["Cache-Control"] = resp.headers["cache-control"]
+        return Response(
+            content=body.encode("utf-8"),
+            status_code=resp.status_code,
+            headers=headers,
+            media_type=ct or "application/vnd.apple.mpegurl",
+        )
     
-    return Response(
-        content=body,
+    # Segment: stream the raw bytes, so upstream length/encoding headers stay valid.
+    headers = {k: v for k, v in resp.headers.items() if k.lower() in _PASSTHROUGH_HEADERS}
+    return StreamingResponse(
+        resp.aiter_raw(),
         status_code=resp.status_code,
-        headers=dict(resp.headers),
-        media_type=ct,
+        headers=headers,
+        background=BackgroundTask(resp.aclose),
     )
 
 
@@ -140,14 +170,3 @@ async def handle_playkey(request: Request) -> Response:
     if not key:
         return JSONResponse(status_code=502, content={"error": "key_fetch_failed"})
     return PlainTextResponse(content=key, media_type="binary/octet-stream")
-
-
-async def handle_stream_proxy(match_id: str, request: Request) -> Response:
-    """Resolve and redirect to the HLS stream URL for a match."""
-    url = await _bleague.resolve_stream_for_match(match_id)
-    if url is None:
-        return JSONResponse(
-            status_code=404,
-            content={"error": "no_stream", "match_id": match_id},
-        )
-    return RedirectResponse(url=url, status_code=302)

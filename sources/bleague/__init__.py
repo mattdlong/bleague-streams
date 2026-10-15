@@ -38,6 +38,17 @@ B_LEAGUE_NAMES = {"B.LEAGUE ONE", "B.LEAGUE PREMIER"}
 
 GAME_END_FLAGS = {"9": "before", "0": "during", "1": "over", "99": "cancel"}
 
+# Live listing covers today and tomorrow (JST); completed looks back this many days.
+LIVE_DAYS_AHEAD         = 1
+COMPLETED_LOOKBACK_DAYS = 7
+
+# Overseas opponents (pre-season / invitational) aren't in /api/v3/teams,
+# so there is no upstream English name for them.
+EXTRA_TEAM_NAMES_EN = {
+    "10558": "SUWON KT SONICBOOM",
+    "10576": "TELEKOM BASKETS BONN",
+}
+
 QUALITY_DEFAULT = "Middle"
 QUANTITY_MAP    = {"8M": "Full HD", "4M": "High", "1.5M": "Middle", "500K": "Low"}
 
@@ -47,6 +58,7 @@ QUANTITY_MAP    = {"8M": "Full HD", "4M": "High", "1.5M": "Middle", "500K": "Low
 
 season_cache  = TTLCache(maxsize=10, ttl=86400)     # never used but kept for NBL1 compat
 data_cache    = TTLCache(maxsize=256, ttl=60)       # schedule / fixture data
+detail_cache  = TTLCache(maxsize=512, ttl=60)       # game detail (stream URL lists)
 team_cache    = TTLCache(maxsize=1, ttl=3600)       # team catalog (rarely changes)
 master_cache  = TTLCache(maxsize=64, ttl=240)       # playkey master URLs (~4 min)
 
@@ -261,10 +273,14 @@ async def fetch_team_catalog() -> dict[str, dict]:
 
 
 async def fetch_game_detail(game_id: str) -> dict | None:
-    """Fetch /api/v9/game/{game_id} and return the parsed game dict."""
+    """Fetch /api/v9/game/{game_id} and return the parsed game dict.
+
+    Cached briefly: the stream URLs are plain CDN paths (no expiring tokens),
+    and listing endpoints would otherwise refetch every game on every request.
+    """
     url = f"{API_BASE}/v9/game/{game_id}"
     try:
-        data = await fetch_json(url)
+        data = await fetch_json(url, cache=detail_cache)
     except UpstreamError:
         log.debug("Game detail fetch failed for %s", game_id)
         return None
@@ -452,6 +468,8 @@ def enrich_game(game_row: dict, team_index: dict, phase: str) -> dict:
     # Resolve teams
     home_idx = team_index.get(home_id, {})
     away_idx = team_index.get(away_id, {})
+    home_en  = home_idx.get("name_en") or EXTRA_TEAM_NAMES_EN.get(home_id or "")
+    away_en  = away_idx.get("name_en") or EXTRA_TEAM_NAMES_EN.get(away_id or "")
     
     # Convert game_date + game_time to UTC datetime string
     gdate = game_row.get("game_date", "")           # "2026-10-14"
@@ -470,15 +488,16 @@ def enrich_game(game_row: dict, team_index: dict, phase: str) -> dict:
         "computed_phase":    phase,
         "start_time_utc":    utc_dt_str,
         "start_time_local":  time_local,
-        "round":             game_row.get("schedule_class_name"),
-        "fixture_type":      game_row.get("schedule_class_name", ""),
+        "round":             game_row.get("occasion_no"),            # 節 (matchweek)
+        "fixture_type":      game_row.get("game_kind_name") or "",   # e.g. B.LEAGUE PRE-SEASON GAME
+        "title":             game_row.get("title"),                  # set on rows with no teams (shows, tours)
         "season_name":       league_name,
         "venue":             venue_ref,
         "conference":        league_name,
         "home_team": {
             "id":        home_id,
             "name_jp":   home_idx.get("name_jp", game_row.get("home_team_name", "")),
-            "name_en":   home_idx.get("name_en"),
+            "name_en":   home_en,
             "name_es":   home_idx.get("name_es"),
             "score":     None,                       # no score on schedule rows
             "logo_url":  None,
@@ -486,7 +505,7 @@ def enrich_game(game_row: dict, team_index: dict, phase: str) -> dict:
         "away_team": {
             "id":        away_id,
             "name_jp":   away_idx.get("name_jp", game_row.get("away_team_name", "")),
-            "name_en":   away_idx.get("name_en"),
+            "name_en":   away_en,
             "name_es":   away_idx.get("name_es"),
             "score":     None,
             "logo_url":  None,
@@ -506,78 +525,97 @@ def _jst_to_utc_iso(jst_str: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Per-conference processors
+# Processors
 # ---------------------------------------------------------------------------
 
 
+LIVE_LIST_PHASES = {"PLAYING", "IN_FUTURE_ONE_DAY", "IN_FUTURE"}
+COMPLETED_LIST_PHASES = {"FINISHED_MISSED_MATCH", "FINISHED"}
+
+
+def _jst_today():
+    return datetime.now(timezone(timedelta(hours=9))).date()
+
+
+def _in_date_range(game_row: dict, first, last) -> bool:
+    try:
+        d = datetime.strptime(game_row.get("game_date") or "", "%Y-%m-%d").date()
+    except ValueError:
+        return False
+    return first <= d <= last
+
+
+async def _fetch_months(first, last) -> list[dict]:
+    """Month schedules covering first..last (dates), deduplicated by game_id."""
+    months: list[str] = []
+    y, m = first.year, first.month
+    while (y, m) <= (last.year, last.month):
+        months.append(f"{y}{m:02d}")
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    results = await asyncio.gather(*(fetch_month_schedule(mo) for mo in months))
+    seen: set[str] = set()
+    games: list[dict] = []
+    for rows in results:
+        for g in rows:
+            gid = g.get("game_id")
+            if gid and gid not in seen:
+                seen.add(gid)
+                games.append(g)
+    return games
+
+
 async def process_live_games(all_games: list[dict], team_index: dict) -> list[dict]:
-    """Filter and enrich games with active/upcoming phases.
-    
-    For PLAYING and FINISHED_MISSED_MATCH: attempt stream resolution.
-    """
+    """Enrich upcoming and in-progress games; resolve streams for PLAYING ones."""
     enriched: list[dict] = []
     for game_row in all_games:
         if not _is_b_league(game_row):
             continue
-        
         phase = compute_phase(game_row)
-        if phase not in LIVE_PHASES:
+        if phase not in LIVE_LIST_PHASES:
             continue
-        
-        game = enrich_game(game_row, team_index, phase)
-        
-        # Resolve stream for live/catch-up games only
-        if phase in ("PLAYING", "FINISHED_MISSED_MATCH"):
-            game["stream_url"] = await resolve_stream_for_match(game["match_id"])
-        
-        enriched.append(game)
+        enriched.append(enrich_game(game_row, team_index, phase))
+    
+    playing = [g for g in enriched if g["computed_phase"] == "PLAYING"]
+    urls = await asyncio.gather(*(resolve_stream_for_match(g["match_id"]) for g in playing))
+    for game, url in zip(playing, urls):
+        game["stream_url"] = url
     
     enriched.sort(key=lambda g: g.get("start_time_utc", ""))
     return enriched
 
 
+async def _attach_catchup(game: dict) -> None:
+    detail = await fetch_game_detail(game["match_id"])
+    if not detail:
+        return
+    missed = detail.get("missed_urls") or []
+    live   = detail.get("live_urls") or []
+    # Legacy fallback: no catch-up list, but live URL still exists
+    urls, title = (missed, "Catch-Up") if missed else (live, "Replay")
+    url = pick_quality(urls, preset="Middle")
+    if url:
+        game["stream_url"] = url
+        game["videos"] = {
+            "full_game": {
+                "video_id":   game["match_id"],
+                "title":      title,
+                "stream_url": url,
+            }
+        }
+
+
 async def process_completed_games(all_games: list[dict], team_index: dict) -> list[dict]:
-    """Filter and enrich finished games with catch-up URLs."""
+    """Enrich finished games and attach catch-up URLs (fetched concurrently)."""
     enriched: list[dict] = []
     for game_row in all_games:
         if not _is_b_league(game_row):
             continue
-        
         phase = compute_phase(game_row)
-        if phase != "FINISHED":
+        if phase not in COMPLETED_LIST_PHASES:
             continue
-        
-        game = enrich_game(game_row, team_index, phase)
-        
-        # Try to find catch-up content
-        detail = await fetch_game_detail(game["match_id"])
-        if detail:
-            missed = detail.get("missed_urls", [])
-            live   = detail.get("live_urls", [])
-            
-            if missed:
-                url = pick_quality(missed, preset="Middle")
-                if url:
-                    game["videos"] = {
-                        "full_game": {
-                            "video_id": game["match_id"],
-                            "title":    "Catch-Up",
-                            "stream_url": url,
-                        }
-                    }
-            elif live:
-                # Legacy fallback: no catch-up list, but live URL still exists
-                url = pick_quality(live, preset="Middle")
-                if url:
-                    game["videos"] = {
-                        "full_game": {
-                            "video_id": game["match_id"],
-                            "title":    "Replay",
-                            "stream_url": url,
-                        }
-                    }
-        
-        enriched.append(game)
+        enriched.append(enrich_game(game_row, team_index, phase))
+    
+    await asyncio.gather(*(_attach_catchup(g) for g in enriched))
     
     enriched.sort(key=lambda g: g.get("start_time_utc", ""), reverse=True)
     return enriched
@@ -589,47 +627,18 @@ async def process_completed_games(all_games: list[dict], team_index: dict) -> li
 
 
 async def fetch_live_games() -> list[dict]:
-    """Today's live and upcoming B.LEAGUE games."""
-    today = datetime.now(timezone.utc)
-    today_jst = today.astimezone(timezone(timedelta(hours=9)))
-    
-    # Fetch both today's day schedule and the current month
-    tasks = [
-        fetch_day_schedule(today_jst.strftime("%Y-%m-%d")),
-        fetch_month_schedule(today_jst.strftime("%Y%m")),
-    ]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    all_games: list[dict] = []
-    for result in results:
-        if isinstance(result, list):
-            all_games.extend(result)
-        elif isinstance(result, Exception):
-            log.warning("Schedule fetch error: %s", result)
-    
-    team_index = await fetch_team_catalog()
-    return await process_live_games(all_games, team_index)
+    """Upcoming and in-progress B.LEAGUE games for today and tomorrow (JST)."""
+    today = _jst_today()
+    last = today + timedelta(days=LIVE_DAYS_AHEAD)
+    games, team_index = await asyncio.gather(_fetch_months(today, last), fetch_team_catalog())
+    games = [g for g in games if _in_date_range(g, today, last)]
+    return await process_live_games(games, team_index)
 
 
 async def fetch_completed_games() -> list[dict]:
-    """Recently completed B.LEAGUE games with catch-up URLs."""
-    now_jst = datetime.now(timezone(timedelta(hours=9)))
-    
-    # Look back 3 months max, but cap at reasonable range
-    months_back = min(3, 12)  # max 3 months lookback
-    all_games: list[dict] = []
-    
-    for i in range(0, months_back):
-        # Compute year/month going back
-        y, m = now_jst.year, now_jst.month
-        for _ in range(i):
-            m -= 1
-            if m < 1:
-                m = 12
-                y -= 1
-        
-        games = await fetch_month_schedule(f"{y}{m:02d}")
-        all_games.extend(games)
-    
-    team_index = await fetch_team_catalog()
-    return await process_completed_games(all_games, team_index)
+    """B.LEAGUE games finished in the last COMPLETED_LOOKBACK_DAYS days (JST)."""
+    today = _jst_today()
+    first = today - timedelta(days=COMPLETED_LOOKBACK_DAYS)
+    games, team_index = await asyncio.gather(_fetch_months(first, today), fetch_team_catalog())
+    games = [g for g in games if _in_date_range(g, first, today)]
+    return await process_completed_games(games, team_index)
